@@ -3,34 +3,25 @@ import DrawingCanvas from '../components/DrawingCanvas.jsx'
 
 const MAX_SELECTED = 4
 
-function ModelSlot({ model, onRemove }) {
+function ModelSlot({ model, onRemove, canvasData }) {
   const [result, setResult] = useState(null)
   const debounceRef = useRef(null)
 
-  const predict = useCallback(async (dataUrl) => {
-    if (!dataUrl) { setResult(null); return }
-    try {
-      const res = await fetch(dataUrl)
-      const blob = await res.blob()
-      const fd = new FormData()
-      fd.append('image', blob, 'digit.png')
-      const resp = await fetch(`/api/predict/${model.id}`, { method: 'POST', body: fd })
-      if (resp.ok) setResult(await resp.json())
-    } catch {}
-  }, [model.id])
-
-  // Exposed so parent can trigger
   useEffect(() => {
+    clearTimeout(debounceRef.current)
+    if (!canvasData) { setResult(null); return }
+    debounceRef.current = setTimeout(async () => {
+      try {
+        const res = await fetch(canvasData)
+        const blob = await res.blob()
+        const fd = new FormData()
+        fd.append('image', blob, 'digit.png')
+        const resp = await fetch(`/api/predict/${model.id}`, { method: 'POST', body: fd })
+        if (resp.ok) setResult(await resp.json())
+      } catch {}
+    }, 120)
     return () => clearTimeout(debounceRef.current)
-  }, [])
-
-  // Store predict fn for parent to call
-  useEffect(() => {
-    model._predict = (dataUrl) => {
-      clearTimeout(debounceRef.current)
-      debounceRef.current = setTimeout(() => predict(dataUrl), 120)
-    }
-  }, [predict, model])
+  }, [canvasData, model.id])
 
   const probs = result?.probabilities
   const pred = result?.prediction
@@ -78,8 +69,8 @@ export default function PredictPage() {
   const [selected, setSelected] = useState([])
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
-  const canvasDataRef = useRef(null)
-  const slotsRef = useRef({})
+  const [canvasData, setCanvasData] = useState(null)
+  const canvasRef = useRef(null)
 
   useEffect(() => {
     fetch('/api/models')
@@ -89,26 +80,14 @@ export default function PredictPage() {
   }, [])
 
   const handleCanvasChange = useCallback((dataUrl) => {
-    canvasDataRef.current = dataUrl
-    selected.forEach(id => {
-      slotsRef.current[id]?._predict?.(dataUrl)
-    })
-  }, [selected])
-
-  // When selection changes, immediately run prediction on current canvas
-  useEffect(() => {
-    selected.forEach(id => {
-      slotsRef.current[id]?._predict?.(canvasDataRef.current)
-    })
-  }, [selected])
+    setCanvasData(dataUrl)
+  }, [])
 
   const toggleModel = (model) => {
     if (selected.includes(model.id)) {
       setSelected(s => s.filter(id => id !== model.id))
     } else if (selected.length < MAX_SELECTED) {
       setSelected(s => [...s, model.id])
-      // Track the model object so slot can update
-      if (!slotsRef.current[model.id]) slotsRef.current[model.id] = { ...model }
     }
   }
 
@@ -132,26 +111,12 @@ export default function PredictPage() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', alignItems: 'center' }}>
           <div style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>Draw a digit</div>
           <DrawingCanvas
-            ref={(ref) => {
-              if (ref) {
-                // Attach the onChange externally via the forwarded ref
-                ref._externalOnChange = handleCanvasChange
-              }
-            }}
+            ref={canvasRef}
             onChange={handleCanvasChange}
           />
           <button
             className="btn btn-ghost btn-sm"
-            onClick={() => {
-              // Clear via document query since we can't store the ref directly here
-              const canvases = document.querySelectorAll('[data-testid="drawing-canvas"]')
-              canvases.forEach(c => {
-                const ctx = c.getContext('2d')
-                ctx.fillStyle = '#000'
-                ctx.fillRect(0, 0, c.width, c.height)
-              })
-              handleCanvasChange(null)
-            }}
+            onClick={() => canvasRef.current?.clear()}
             data-testid="clear-canvas-btn"
           >
             Clear
@@ -171,6 +136,7 @@ export default function PredictPage() {
                   key={m.id}
                   model={m}
                   onRemove={() => removeSelected(m.id)}
+                  canvasData={canvasData}
                 />
               ))}
             </div>
