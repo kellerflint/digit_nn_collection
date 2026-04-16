@@ -4,6 +4,9 @@ import uuid
 import csv
 import zipfile
 import logging
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
 
@@ -14,7 +17,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Que
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
-from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, inspect, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, inspect, text, func, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -34,9 +37,22 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
-engine = create_engine(f"sqlite:///{DB_PATH}", connect_args={"check_same_thread": False})
+engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    connect_args={"check_same_thread": False},
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+@event.listens_for(engine, "connect")
+def _set_sqlite_pragmas(dbapi_conn, _):
+    cur = dbapi_conn.cursor()
+    cur.execute("PRAGMA journal_mode=WAL")
+    cur.execute("PRAGMA synchronous=NORMAL")
+    cur.execute("PRAGMA cache_size=-32000")  # 32 MB page cache
+    cur.execute("PRAGMA temp_store=MEMORY")
+    cur.close()
 
 
 class DigitImage(Base):
@@ -93,21 +109,51 @@ def get_db():
         db.close()
 
 
-# ── TensorFlow (lazy) ─────────────────────────────────────────────────────────
+# ── TensorFlow (lazy, thread-safe) ────────────────────────────────────────────
 # TF is only imported when a model is actually used. This keeps startup fast
 # and lets the backend run without TF installed (digit collection still works).
 
 _tf = None
+_tf_lock = threading.Lock()
+
 
 def _get_tf():
     global _tf
     if _tf is None:
-        try:
-            import tensorflow as tf
-            _tf = tf
-        except ImportError:
-            raise HTTPException(status_code=501, detail="TensorFlow not available on this server")
+        with _tf_lock:
+            if _tf is None:
+                try:
+                    import tensorflow as tf
+                    _tf = tf
+                except ImportError:
+                    raise HTTPException(status_code=501, detail="TensorFlow not available on this server")
     return _tf
+
+
+# ── Model cache ───────────────────────────────────────────────────────────────
+# Keras models are safe for concurrent inference. Since every upload gets a
+# UUID filename, paths are immutable — no invalidation needed except on delete.
+
+_model_cache: dict = {}
+_model_cache_lock = threading.Lock()
+
+
+def get_cached_model(model_path: str):
+    """Load a Keras model from disk, caching it in memory by path."""
+    with _model_cache_lock:
+        if model_path not in _model_cache:
+            _model_cache[model_path] = load_keras_model(model_path)
+        return _model_cache[model_path]
+
+
+def evict_model_cache(model_path: str) -> None:
+    with _model_cache_lock:
+        _model_cache.pop(model_path, None)
+
+
+# ── Thread pool for CPU-bound TF work ────────────────────────────────────────
+# Limits concurrent TF jobs so we don't saturate the server.
+_executor = ThreadPoolExecutor(max_workers=2)
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
@@ -133,7 +179,7 @@ def run_inference(model_path: str, img_bytes: bytes) -> Optional[dict]:
     """
     tf = _get_tf()
     try:
-        model = load_keras_model(model_path)
+        model = get_cached_model(model_path)
         arr = preprocess_for_inference(img_bytes)
         input_shape = model.input_shape
 
@@ -158,43 +204,59 @@ def run_inference(model_path: str, img_bytes: bytes) -> Optional[dict]:
         return None
 
 
-def compute_accuracy(model_path: str, db: Session) -> Optional[float]:
-    """Accuracy on validation-set images only."""
-    images = db.query(DigitImage).filter(DigitImage.is_validation == True).all()
-    if not images:
+def compute_accuracy(model_path: str, image_data: list) -> Optional[float]:
+    """
+    Batch accuracy over validation images.
+    image_data: list of (absolute_image_path, label) tuples pre-loaded from DB.
+    All images are batched into a single model.predict() call.
+    """
+    if not image_data:
         return None
     try:
-        tf = _get_tf()
-        model = load_keras_model(model_path)
+        model = get_cached_model(model_path)
     except Exception as e:
         logger.error(f"Failed to load model for accuracy: {e}")
         return None
 
     input_shape = model.input_shape
-    correct = 0
-    total = 0
-    for img_rec in images:
-        img_path = os.path.join(IMAGES_DIR, img_rec.filename)
+    arrays = []
+    labels = []
+    for img_path, label in image_data:
         if not os.path.exists(img_path):
             continue
         try:
             with open(img_path, "rb") as f:
                 arr = preprocess_for_inference(f.read())
-            if len(input_shape) == 4:
-                x = arr.reshape(1, 28, 28, 1)
-            elif len(input_shape) == 3:
-                x = arr.reshape(1, 28, 28)
-            elif len(input_shape) == 2 and input_shape[1] == 784:
-                x = arr.reshape(1, 784)
-            else:
-                x = arr.reshape(1, 28, 28, 1)
-            preds = model.predict(x, verbose=0)[0]
-            if int(np.argmax(preds)) == img_rec.label:
-                correct += 1
-            total += 1
+            arrays.append(arr)
+            labels.append(label)
         except Exception as e:
-            logger.warning(f"Skipping image {img_rec.id}: {e}")
-    return correct / total if total > 0 else None
+            logger.warning(f"Skipping {img_path}: {e}")
+
+    if not arrays:
+        return None
+
+    batch = np.stack(arrays)  # (N, 28, 28, 1)
+    if len(input_shape) == 4:
+        x = batch.reshape(-1, 28, 28, 1)
+    elif len(input_shape) == 3:
+        x = batch.reshape(-1, 28, 28)
+    elif len(input_shape) == 2 and input_shape[1] == 784:
+        x = batch.reshape(-1, 784)
+    else:
+        x = batch.reshape(-1, 28, 28, 1)
+
+    preds = model.predict(x, verbose=0)
+    predicted = np.argmax(preds, axis=1)
+    correct = int(np.sum(predicted == np.array(labels, dtype=np.int32)))
+    return correct / len(labels)
+
+
+def _val_image_data(db: Session) -> list:
+    """Load validation image paths and labels from DB (fast, no TF)."""
+    rows = db.query(DigitImage.filename, DigitImage.label).filter(
+        DigitImage.is_validation == True
+    ).all()
+    return [(os.path.join(IMAGES_DIR, filename), label) for filename, label in rows]
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -327,30 +389,40 @@ def digit_stats(
     class_name: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    q = db.query(DigitImage)
+    # SQL aggregation instead of loading all rows into Python
+    q = db.query(
+        DigitImage.label,
+        DigitImage.is_validation,
+        func.count(DigitImage.id).label("cnt"),
+    )
     if class_name:
         q = q.filter(DigitImage.class_name == class_name)
-    items = q.all()
+    rows = q.group_by(DigitImage.label, DigitImage.is_validation).all()
 
     histogram = {str(i): 0 for i in range(10)}
     val_histogram = {str(i): 0 for i in range(10)}
-    class_names = set()
-    for item in items:
-        if item.is_validation:
-            val_histogram[str(item.label)] += 1
+    training_total = 0
+    validation_total = 0
+    for label, is_val, cnt in rows:
+        if is_val:
+            val_histogram[str(label)] = cnt
+            validation_total += cnt
         else:
-            histogram[str(item.label)] += 1
-        class_names.add(item.class_name)
+            histogram[str(label)] = cnt
+            training_total += cnt
 
-    training_total = sum(histogram.values())
-    validation_total = sum(val_histogram.values())
+    class_q = db.query(DigitImage.class_name).distinct()
+    if class_name:
+        class_q = class_q.filter(DigitImage.class_name == class_name)
+    class_names = sorted(r[0] for r in class_q.all())
+
     return {
         "histogram": histogram,
         "val_histogram": val_histogram,
         "total": training_total + validation_total,
         "training_total": training_total,
         "validation_total": validation_total,
-        "class_names": sorted(class_names),
+        "class_names": class_names,
     }
 
 
@@ -407,8 +479,9 @@ async def upload_model(
     with open(save_path, "wb") as f:
         f.write(content)
 
+    # Validate and cache the model (quick load, populates cache for accuracy step)
     try:
-        load_keras_model(save_path)
+        get_cached_model(save_path)
     except HTTPException:
         os.remove(save_path)
         raise
@@ -416,7 +489,14 @@ async def upload_model(
         os.remove(save_path)
         raise HTTPException(status_code=400, detail=f"Invalid Keras model: {e}")
 
-    accuracy = compute_accuracy(save_path, db)
+    # Snapshot validation image paths+labels before leaving the DB session
+    image_data = _val_image_data(db)
+
+    # Run batch accuracy in thread pool — non-blocking, model already cached
+    loop = asyncio.get_running_loop()
+    accuracy = await loop.run_in_executor(
+        _executor, lambda: compute_accuracy(save_path, image_data)
+    )
 
     record = ModelSubmission(
         submission_name=submission_name,
@@ -467,13 +547,14 @@ def delete_model(
     model_path = os.path.join(MODELS_DIR, record.filename)
     if os.path.exists(model_path):
         os.remove(model_path)
+        evict_model_cache(model_path)
     db.delete(record)
     db.commit()
     return {"ok": True}
 
 
 @app.post("/api/models/{model_id}/recalculate")
-def recalculate_accuracy(
+async def recalculate_accuracy(
     model_id: int,
     x_admin_password: str = Query(...),
     db: Session = Depends(get_db),
@@ -484,7 +565,12 @@ def recalculate_accuracy(
     if not record:
         raise HTTPException(status_code=404, detail="Not found")
     model_path = os.path.join(MODELS_DIR, record.filename)
-    accuracy = compute_accuracy(model_path, db)
+
+    image_data = _val_image_data(db)
+    loop = asyncio.get_running_loop()
+    accuracy = await loop.run_in_executor(
+        _executor, lambda: compute_accuracy(model_path, image_data)
+    )
     record.accuracy = accuracy
     db.commit()
     return {"id": record.id, "accuracy": accuracy}
@@ -503,7 +589,9 @@ async def predict(
     if not os.path.exists(model_path):
         raise HTTPException(status_code=404, detail="Model file missing")
     content = await image.read()
-    result = run_inference(model_path, content)
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(_executor, run_inference, model_path, content)
     if result is None:
         raise HTTPException(status_code=500, detail="Inference failed")
     return result
