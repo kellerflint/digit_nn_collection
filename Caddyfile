@@ -1,0 +1,14 @@
+:80 {
+    # API and static image files go to backend
+    handle /api/* {
+        reverse_proxy backend:8000
+    }
+    handle /images/* {
+        reverse_proxy backend:8000
+    }
+
+    # Everything else goes to the React frontend
+    handle {
+        reverse_proxy frontend:80
+    }
+}

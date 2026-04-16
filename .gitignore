@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+frontend/dist/
+
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Data (never commit collected images or uploaded models)
+/data/
+
+# Playwright
+tests/playwright-report/
+tests/test-results/
+
+# OS
+.DS_Store
